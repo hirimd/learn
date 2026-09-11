@@ -1,42 +1,44 @@
 # Firecrawl Installation Guide
 
-This guide walks through installing, configuring, and running [Firecrawl](https://github.com/firecrawl/firecrawl) (formerly `mendableai/firecrawl`), the open source API service that turns websites into clean, LLM ready data (Markdown, structured JSON, etc.).
+This guide walks through installing, configuring, and running [Firecrawl](https://github.com/firecrawl/firecrawl), the open source API service that turns websites into clean, LLM ready data (Markdown, structured JSON, etc.).
+
+Everything below was checked directly against a fresh clone of the repository (Docker Compose file, `SELF_HOST.md`, `CONTRIBUTING.md`, and `apps/api/package.json`) rather than written from memory, since the project's self hosting setup has changed significantly from earlier versions: it now runs RabbitMQ and a Postgres backed queue ("NuQ") alongside the API, worker, and Playwright rendering service.
 
 ## Prerequisites
 
-Install the following before you begin:
-
-| Tool | Minimum Version | Purpose |
+| Tool | Version | Purpose |
 |---|---|---|
 | Git | any recent version | Clone the repository |
-| Docker | 24+ | Run the containerized stack (Method A) |
-| Docker Compose | v2 (bundled with Docker Desktop) | Orchestrate multi-container services |
-| Node.js | 18+ (20 LTS recommended) | Run the API/worker locally (Method B) |
-| pnpm | 9+ | Package manager used by the monorepo |
-| Redis | 7+ | Job queue backing store (only needed standalone for Method B; Docker Compose provides it automatically) |
+| Docker | 24+ | Run the containerized stack (Method A), and build local dependency containers for Method B |
+| Docker Compose | v2 (bundled with Docker Desktop) | Orchestrate the multi-container stack |
+| Node.js | 22 | Run the API/worker locally (Method B) |
+| pnpm | exactly `11.4.0`, pinned in `apps/api/package.json` | Package manager; use Corepack rather than a globally installed pnpm to avoid version mismatches |
+| Redis | 7+ | Job queue/rate limiting store; Docker Compose provides it automatically, Method B expects you to run it yourself |
+| FoundationDB client library | matches the version pinned in `docker-compose.yaml` (`7.3.63` at the time of writing) | Only needed for Method B: `apps/api` depends directly on the `foundationdb` npm package, which compiles a native addon against local FoundationDB client headers |
 
 Installation commands by platform:
 
 macOS (Homebrew):
 ```bash
-brew install git node pnpm redis
+brew install git node redis
 brew install --cask docker
+corepack enable
 ```
 
 Ubuntu/Debian:
 ```bash
 sudo apt update
-sudo apt install -y git curl
+sudo apt install -y git curl redis-server
 curl -fsSL https://get.docker.com | sudo sh
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo bash -
 sudo apt install -y nodejs
-npm install -g pnpm
+corepack enable
 ```
 
 Windows:
 - Install [Git for Windows](https://git-scm.com/download/win)
 - Install [Docker Desktop](https://www.docker.com/products/docker-desktop) (includes Docker Compose and WSL2 integration)
-- Install [Node.js](https://nodejs.org/) via the official installer, then run `npm install -g pnpm` in PowerShell
+- Install [Node.js 22](https://nodejs.org/), then run `corepack enable` in PowerShell
 - Run all commands below inside WSL2 (Ubuntu) or PowerShell; Docker Desktop handles the Linux container layer either way
 
 Verify your setup:
@@ -45,8 +47,15 @@ git --version
 docker --version
 docker compose version
 node --version
-pnpm --version
+corepack --version
 ```
+
+**Only needed for Method B** (local, non-Docker development): install the FoundationDB client library so `pnpm install` in `apps/api` can compile its native dependency. On Debian/Ubuntu:
+```bash
+curl -fsSLO https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-clients_7.3.63-1_amd64.deb
+sudo dpkg -i foundationdb-clients_7.3.63-1_amd64.deb
+```
+On macOS, use the matching `.pkg` from the same [FoundationDB releases page](https://github.com/apple/foundationdb/releases). Without this, `pnpm install` fails with `fatal error: foundationdb/fdb_c.h: No such file or directory`.
 
 ## Step 1: Clone the Repository
 
@@ -55,57 +64,54 @@ git clone https://github.com/firecrawl/firecrawl.git
 cd firecrawl
 ```
 
+For a self hosted deployment, `SELF_HOST.md` recommends checking out an exact release tag rather than `main`, since the API code and the Compose file's floating image tags can drift independently:
+```bash
+git fetch --tags
+git checkout <release-tag>
+```
+
 ## Step 2: Environment Configuration
 
-Firecrawl's configuration lives in an `.env` file consumed by the API and worker services. Copy the example file and edit it:
+Firecrawl uses **two separate environment files** for two separate workflows; do not copy one into the other:
 
+- **Docker Compose (Method A)** reads a `.env` file at the **repository root**, which only overrides the small set of variables `docker-compose.yaml` actually references. Every one of those variables already has a sane default (`docker-compose.yaml` uses `${VAR:-default}` throughout), so a root `.env` is optional for a first run; create one only when you need to set something like an LLM API key:
+```bash
+cat > .env <<'EOF'
+# Optional: only needed if you use LLM-powered extraction features
+OPENAI_API_KEY=
+
+# Optional: change the host port the API is published on (default 3002)
+# PORT=3002
+EOF
+```
+- **Local development (Method B)** reads `apps/api/.env`, copied from the example file:
 ```bash
 cp apps/api/.env.example apps/api/.env
 ```
-
-Open `apps/api/.env` in your editor and review the key variables. For a self hosted, local only setup, the defaults below are typically enough to get started:
-
+Key variables to check in `apps/api/.env`:
 ```bash
-# Core service
-PORT=3002
-HOST=0.0.0.0
+# For local dev, point these at localhost instead of the Docker service names
+REDIS_URL=redis://localhost:6379
+PLAYWRIGHT_MICROSERVICE_URL=http://localhost:3000/scrape
 
-# Redis connection (matches the docker-compose service name)
-REDIS_URL=redis://redis:6379
-REDIS_RATE_LIMIT_URL=redis://redis:6379
-
-# Disable hosted auth/database requirements for local/self-host use
-USE_DB_AUTHENTICATION=false
-
-# Headless browser service used for JS-rendered pages
-PLAYWRIGHT_MICROSERVICE_URL=http://playwright-service:3000/scrape
-
-# Optional: only needed if you want LLM-powered extraction features
+# Optional: only needed for LLM-powered extraction features
 OPENAI_API_KEY=
 ```
 
-Notes:
-- If you plan to run services outside Docker (Method B), change `redis://redis:6379` and `http://playwright-service:3000/scrape` to `localhost` equivalents, since there is no Docker network to resolve those service names.
-- `OPENAI_API_KEY` (or another supported LLM provider key) is only required if you use extraction/summarization features that call an LLM; basic scraping and crawling work without it.
-- Treat `.env` as secret; never commit it. It should already be covered by `.gitignore`.
+`USE_DB_AUTHENTICATION` defaults to disabled either way, so a self-hosted instance does not require an API key for local testing until you deliberately configure a database backed auth layer.
 
 ## Step 3: Run Firecrawl (choose one method)
 
 ### Method A: Using Docker (Recommended)
 
-This is the simplest path since it starts the API, worker, Redis, and the Playwright rendering service together with correct networking.
+`docker compose up` starts everything defined in `docker-compose.yaml`: the API (which internally launches its own workers), the Playwright rendering service, Redis, RabbitMQ, and a Postgres-backed queue ("nuq-postgres"). Only the API is published to the host, on port 3002 by default.
 
-Build the images:
+Build and start the stack:
 ```bash
-docker compose build
+docker compose up -d --build
 ```
 
-Start the stack in the background:
-```bash
-docker compose up -d
-```
-
-Check that all containers are healthy:
+Check container status:
 ```bash
 docker compose ps
 ```
@@ -120,68 +126,55 @@ Stop the stack when you are done:
 docker compose down
 ```
 
+Per `SELF_HOST.md`, keep in mind for anything beyond local testing: the default API has no authentication, no TLS, and the Compose file defines no persistent volumes for Postgres/Redis/RabbitMQ, so data does not survive a `docker compose down`.
+
 ### Method B: Local Development Setup
 
-Use this if you want to run and debug the TypeScript code directly (hot reload, breakpoints, etc.).
+Use this to run and debug the TypeScript code directly. This does **not** use `docker-compose.yaml`; instead, Firecrawl's own "harness" script manages the Postgres and RabbitMQ containers for you (it shells out to `docker`/`podman`), while you run Redis and the Playwright service yourself.
 
-1. Start Redis (skip if you already have one running):
+1. Start Redis (skip if one is already running):
 ```bash
 redis-server --daemonize yes
 ```
-On Windows without WSL, run Redis via Docker instead: `docker run -d -p 6379:6379 redis:7-alpine`.
 
-2. Install dependencies from the repo root:
-```bash
-pnpm install
-```
-
-3. Update `apps/api/.env` so Redis and the Playwright service point at `localhost` instead of Docker service names:
-```bash
-REDIS_URL=redis://localhost:6379
-REDIS_RATE_LIMIT_URL=redis://localhost:6379
-PLAYWRIGHT_MICROSERVICE_URL=http://localhost:3003/scrape
-```
-
-4. In one terminal, start the Playwright rendering service:
+2. In one terminal, build and start the Playwright rendering service:
 ```bash
 cd apps/playwright-service-ts
-pnpm install
-pnpm run start
+corepack pnpm install
+corepack pnpm run build
+corepack pnpm run start
 ```
 
-5. In a second terminal, start the API server:
+3. In a second terminal, install and start the API (make sure `apps/api/.env` is configured as in Step 2, and the FoundationDB client library from the Prerequisites section is installed first):
 ```bash
 cd apps/api
-pnpm run start
+corepack pnpm install
+corepack pnpm start
 ```
+`pnpm start` builds the project, then runs the harness, which will build/launch its own `nuq-postgres` and `rabbitmq` containers automatically and start the API together with its workers. Watch the terminal output; the harness logs each service it brings up.
 
-6. In a third terminal, start the background worker (handles queued crawl/scrape jobs):
-```bash
-cd apps/api
-pnpm run workers
-```
-
-Keep all three processes running while you develop; the API depends on the worker to actually process jobs and on the Playwright service for JavaScript-rendered pages.
+If you'd rather run components individually instead of through the harness (useful for debugging one piece at a time), `apps/api/package.json` exposes granular scripts such as `pnpm run workers`, `pnpm run extract-worker`, and `pnpm run index-worker`, but the harness-driven `pnpm start` is the supported first-run path.
 
 ## Step 4: Verify the Installation
 
 Once the stack is up (either method), confirm the API responds:
 
 ```bash
-curl http://localhost:3002/test
+curl http://localhost:3002/
 ```
 
-You should get back a simple confirmation response (for example, `Hello, world!`), indicating the API process is reachable on port 3002.
+A healthy instance returns JSON like:
+```json
+{"message":"Firecrawl API","documentation_url":"https://docs.firecrawl.dev"}
+```
 
 Next, try an actual scrape request:
-
 ```bash
 curl -s -X POST http://localhost:3002/v1/scrape \
   -H "Content-Type: application/json" \
   -d '{"url": "https://firecrawl.dev"}'
 ```
-
-A successful response returns JSON containing `success: true` and a `data` object with the scraped Markdown/HTML content. If you disabled DB authentication (`USE_DB_AUTHENTICATION=false`), you do not need an `Authorization` header for local testing; otherwise include `-H "Authorization: Bearer <your_api_key>"`.
+A successful response returns JSON with `success: true` and a `data` object containing the scraped Markdown/HTML. With the default `USE_DB_AUTHENTICATION=false`, no `Authorization` header is required for local testing.
 
 For a crawl (multi-page) job:
 ```bash
@@ -193,40 +186,46 @@ This returns a job ID; poll `GET http://localhost:3002/v1/crawl/<job_id>` to che
 
 ## Troubleshooting (Common Issues)
 
-**Port already in use (3002, 6379, or 3003)**
-Find and stop the conflicting process, or change the port mapping:
+**Port already in use (3002, 6379, 5672, or 5432)**
 ```bash
 lsof -i :3002
 ```
-Then either kill the conflicting process or edit the `ports` section in `docker-compose.yaml` (e.g., map `3002:3002` to `3010:3002`) and update `PORT`/your test URLs to match.
+Kill the conflicting process, or (Method A) set `PORT=<other-port>` in the root `.env` to change the host-side mapping, since `docker-compose.yaml` maps `${PORT:-3002}:${INTERNAL_PORT:-3002}`.
+
+**`pnpm install` fails with `fatal error: foundationdb/fdb_c.h: No such file or directory`**
+This is Method B only. `apps/api` has a plain (non-optional) dependency on the `foundationdb` npm package, which compiles a native addon against the FoundationDB C client headers. Install the client library from the Prerequisites section before running `pnpm install` again.
+
+**`pnpm install` or `pnpm start` behaves unexpectedly / wrong pnpm version**
+`apps/api/package.json` pins `"packageManager": "pnpm@11.4.0"`. Always invoke it via `corepack pnpm ...` (after `corepack enable`) rather than a separately installed global pnpm, so the exact pinned version is used.
 
 **API container starts but scrape requests time out or fail**
-Usually means the worker isn't running or can't reach Redis. Check:
+Usually means a dependency service isn't reachable. Check:
 ```bash
 docker compose logs api
-docker compose logs worker
 docker compose logs redis
+docker compose logs rabbitmq
+docker compose logs nuq-postgres
 ```
-Confirm `REDIS_URL` matches the Redis container/service name (Docker) or `localhost` (local dev).
+For Method B, confirm Redis is actually running on `localhost:6379` and that the harness's log output shows the Postgres/RabbitMQ containers started successfully.
 
 **JavaScript-heavy pages return empty content**
-The Playwright rendering service may not be reachable. Confirm `PLAYWRIGHT_MICROSERVICE_URL` is correct and the service container/process is running (`docker compose ps` or check the local terminal running `apps/playwright-service-ts`).
+Confirm `PLAYWRIGHT_MICROSERVICE_URL` matches how you're running things (`http://playwright-service:3000/scrape` for Compose, `http://localhost:3000/scrape` for local dev) and that the Playwright service process/container is actually up.
 
-**"Missing API key" or auth errors**
-If `USE_DB_AUTHENTICATION=true`, the API expects a valid key and a configured Supabase/database backend. For local self-hosting without a hosted auth layer, set `USE_DB_AUTHENTICATION=false` in `.env` and omit the `Authorization` header.
+**Docker image pulls fail with 403/Forbidden from a CDN like `production.cloudfront.docker.com`**
+This means the network your Docker daemon runs on is blocking Docker Hub's blob storage CDN (common behind restrictive corporate proxies or locked-down sandboxes) — it is not a Firecrawl issue. Fix it at the network/proxy level (allow that host, or configure Docker to pull through an authorized mirror/registry) rather than retrying repeatedly.
 
 **LLM-based extraction features fail silently**
-These require a valid provider key such as `OPENAI_API_KEY`. Set it in `apps/api/.env` and restart the API/worker so the new environment variable is picked up.
+These require a valid provider key such as `OPENAI_API_KEY`, set in the root `.env` (Method A) or `apps/api/.env` (Method B), followed by a restart of the relevant service.
 
 **Changes to `.env` don't seem to apply**
-Environment variables are read at process start. After editing `.env`, restart the affected service:
+Environment variables are read at process start.
 ```bash
-docker compose restart api worker
+docker compose restart api
 ```
-or, for local dev, stop and re-run the relevant `pnpm run` command.
+or, for local dev, stop and re-run `corepack pnpm start`.
 
 **Docker build is slow or fails on first run**
-The initial build compiles the API, worker, and Playwright service images and can take several minutes, especially on the first run since base images and browser binaries need to download. Ensure you have a stable network connection and enough free disk space (several GB), then retry:
+The initial build compiles the API and Playwright service images, which can take several minutes on first run. Ensure a stable connection and enough free disk space (several GB), then retry:
 ```bash
 docker compose build --no-cache
 ```
